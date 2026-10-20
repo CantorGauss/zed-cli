@@ -1,32 +1,34 @@
 # Zed CLI
 
-Prototype de déchiffrement et d'extraction d'archives `.zed` protégées par mot de passe. L'archive est lue sans être modifiée ; les fichiers déjà présents ne sont pas écrasés.
+A read-only prototype for listing and extracting password-protected `.zed` archives. It does not modify the archive and refuses to overwrite existing output files.
 
-## Utilisation
+## Requirements
 
-Python 3.10 ou plus récent est nécessaire. Le script utilise OpenSSL `libcrypto` du système sur macOS et Linux. Sur les systèmes où cette bibliothèque n'est pas disponible, installez le moteur AES Python :
+Python 3.10 or newer is required. For AES, the script uses either the system OpenSSL `libcrypto` library (available on macOS and many Linux systems) or the optional `cryptography` package. Install the package if `libcrypto` is unavailable, including on Windows:
 
 ```sh
 python3 -m pip install cryptography
 ```
 
-Listez le contenu ou extrayez les fichiers :
+## Usage
+
+List an archive's contents or extract its files:
 
 ```sh
 python3 zed.py archive.zed --list
-python3 zed.py archive.zed -o dossier_de_sortie
+python3 zed.py archive.zed -o output_directory
 ```
 
-Le mot de passe est demandé de manière interactive. Il n'est pas passé en argument de la commande.
+The CLI prompts for the password interactively; it does not accept a password as a command-line argument.
 
-## Portée
+## Supported formats and limitations
 
-Le prototype prend en charge les utilisateurs `passworduser`, AES-CBC-STREAM et AES-CBC-CTS (CBC-CS3), PBKDF2-SHA-256 et la dérivation PKCS#12 SHA-1/SHA-256 décrite dans la [documentation du format Zed](https://www.beuc.net/zed/zed.md). Les utilisateurs `rsauser` déverrouillés par certificat ne sont pas pris en charge.
+This prototype supports `passworduser` entries, AES-CBC-STREAM and AES-CBC-CTS (CBC-CS3), PBKDF2-SHA-256, and the PKCS#12 SHA-1/SHA-256 key derivation described in the [Zed format documentation](https://www.beuc.net/zed/zed.md). Certificate-based `rsauser` entries are not supported.
 
-Les tests utilisent des vecteurs publics et ne contiennent ni archive privée ni mot de passe :
+The tests use public vectors. No private archive or password is included in this repository:
 
 ```sh
 python3 -m unittest discover -s tests
 ```
 
-Ce projet est un prototype indépendant, sans lien avec l'éditeur de Zed.
+This is an independent prototype and is not affiliated with the publisher of Zed.
