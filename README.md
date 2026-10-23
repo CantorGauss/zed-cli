@@ -31,4 +31,10 @@ The tests use public vectors. No private archive or password is included in this
 python3 -m unittest discover -s tests
 ```
 
-This is an independent prototype and is not affiliated with the publisher of Zed.
+## Disclaimer
+
+This is an independent, unofficial project. It is not affiliated with, endorsed by or supported by Prim'X Technologies. Zed!, ZoneCentral and Prim'X are trademarks of their respective owners; they are used here only to identify the file format this tool reads.
+
+The tool exists for interoperability: it lets people open `.zed` archives they are entitled to read, for example on systems where the official software is not available. It requires the archive's password and provides no way to bypass, recover or guess it. It never creates or modifies archives.
+
+The implementation was written from Sylvain Beucler's public [description of the .zed file format](https://www.beuc.net/zed/) (© 2017 Sylvain Beucler). No Prim'X code was copied or decompiled.
