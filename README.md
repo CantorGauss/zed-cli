@@ -4,7 +4,7 @@ A read-only prototype for listing and extracting password-protected `.zed` archi
 
 ## Requirements
 
-Python 3.10 or newer is required. For AES, the script uses either the system OpenSSL `libcrypto` library (available on macOS and many Linux systems) or the optional `cryptography` package. Install the package if `libcrypto` is unavailable, including on Windows:
+Python 3.10 or newer is required. For AES, the script uses either an OpenSSL `libcrypto` library (the system one on many Linux systems; on macOS a separately installed OpenSSL such as `brew install openssl@3`, because macOS aborts any process that loads its own unversioned `libcrypto`) or the optional `cryptography` package. Install the package if `libcrypto` is unavailable, including on Windows:
 
 ```sh
 python3 -m pip install cryptography
