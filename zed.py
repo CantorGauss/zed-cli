@@ -15,10 +15,11 @@ import hashlib
 import hmac
 import struct
 import sys
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -56,7 +57,11 @@ class CFB:
         fat_count = struct.unpack_from("<I", data, 44)[0]
         difat = list(struct.unpack_from("<109I", data, 76))
         next_difat = struct.unpack_from("<I", data, 68)[0]
+        seen = set()
         for _ in range(struct.unpack_from("<I", data, 72)[0]):
+            if next_difat in seen:
+                raise ZedError("invalid CFB DIFAT chain")
+            seen.add(next_difat)
             sector = self.sector(next_difat)
             entries = struct.unpack_from(f"<{self.sector_size // 4}I", sector)
             difat.extend(entries[:-1])
@@ -135,14 +140,24 @@ class CFB:
 
 
 class AES:
+    MACOS_LIBCRYPTO = (
+        "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+        "/usr/local/opt/openssl@3/lib/libcrypto.3.dylib",
+        "/opt/local/lib/libcrypto.3.dylib",
+    )
+
     def __init__(self):
         # Bundled applications use cryptography; the standalone CLI can still
         # use the system OpenSSL library without installing Python packages.
         if Cipher is not None:
             return
         path = ctypes.util.find_library("crypto")
+        if sys.platform == "darwin" and (not path or path.startswith("/usr/lib/")):
+            # macOS aborts any process that loads its unversioned system
+            # libcrypto, so only use an OpenSSL installed separately.
+            path = next((p for p in self.MACOS_LIBCRYPTO if Path(p).exists()), None)
         if not path:
-            raise ZedError("OpenSSL libcrypto not found")
+            raise ZedError("OpenSSL libcrypto not found; install the cryptography package")
         self.lib = ctypes.CDLL(path)
         ptr = ctypes.c_void_p
         self.lib.EVP_CIPHER_CTX_new.restype = ptr
@@ -311,9 +326,18 @@ class ZedArchive:
     METADATA_NAME = "\x05" + "5haaaaqaIekzeecnWj31zxh0Nc"
     DELIMITER = bytes.fromhex("0765921a2a0774534752073361719300")
     STATIC_KEY = bytes.fromhex("37f13cf81c780af26b6a52654f794aef")
+    MAX_PIECE = 1 << 20
 
     def __init__(self, path: Path, password: str):
-        self.cfb = CFB(path.read_bytes())
+        data = path.read_bytes()
+        try:
+            self._parse(data, password)
+        except (struct.error, ValueError, IndexError) as exc:
+            # Truncated or inconsistent structures surface as low-level errors.
+            raise ZedError(f"malformed archive: {exc}") from exc
+
+    def _parse(self, data: bytes, password: str) -> None:
+        self.cfb = CFB(data)
         self.aes = AES()
         blobs = property_blobs(self.cfb.stream(self.METADATA_NAME))
         control_ids = [i for i, blob in blobs.items() if blob.startswith(self.DELIMITER)]
@@ -358,6 +382,7 @@ class ZedArchive:
             self.entries.append(Entry(file_id, parent_id, name, size, is_dir))
 
     def _unlock(self, users: list[tuple[bytes, bytes]], password: str) -> bytes:
+        failure = None
         for kind, value in users:
             if kind != bytes.fromhex("80610600"):
                 continue
@@ -367,6 +392,8 @@ class ZedArchive:
             if digest is None and hash_id != 42:
                 continue
             check = field(user, "80790500")
+            if not check:
+                continue
             pba_salt = field(user, "807a0500")
             pba_iter = u32be(field(user, "807b0200"))
             if not 1 <= pba_iter <= 10_000_000:
@@ -390,29 +417,44 @@ class ZedArchive:
             ciphertext = field(user, "80740500")
             plaintext = self.aes.cipher(ciphertext, key, iv, True)
             if not plaintext or plaintext[-1] not in range(1, 17) or plaintext[-plaintext[-1]:] != bytes([plaintext[-1]]) * plaintext[-1]:
-                raise ZedError("invalid archive key padding")
+                # Another user entry may still unlock the archive.
+                failure = ZedError("invalid archive key padding")
+                continue
             archive_key = plaintext[:-plaintext[-1]]
             if len(archive_key) != self.strength:
-                raise ZedError("invalid archive key length")
+                failure = ZedError("invalid archive key length")
+                continue
             return archive_key
-        raise ZedError("password does not match any supported password user")
+        raise failure or ZedError("password does not match any supported password user")
 
     def names(self) -> list[tuple[Entry, Path]]:
         by_id = {entry.file_id: entry for entry in self.entries}
-        def relative(entry: Entry, seen: set[bytes]) -> Path:
-            if entry.file_id in seen:
-                raise ZedError("directory cycle in catalog")
-            if entry.name in ("", ".", "..") or "/" in entry.name or "\\" in entry.name or "\x00" in entry.name:
-                raise ZedError("unsafe filename in catalog")
-            if not any(entry.parent_id):
-                return Path(entry.name)
-            parent = by_id.get(entry.parent_id)
-            if parent is None or not parent.is_dir:
-                raise ZedError("missing parent directory")
-            return relative(parent, seen | {entry.file_id}) / entry.name
-        return [(entry, relative(entry, set())) for entry in self.entries]
+        def relative(entry: Entry) -> Path:
+            # Walk up iteratively so deeply nested catalogs cannot exhaust the stack.
+            parts = []
+            seen = set()
+            while True:
+                if entry.file_id in seen:
+                    raise ZedError("directory cycle in catalog")
+                seen.add(entry.file_id)
+                # Zed archives come from Windows, where ":" never appears in a
+                # filename; rejecting it also blocks drive-relative paths.
+                if entry.name in ("", ".", "..") or any(c in entry.name for c in "/\\:\x00"):
+                    raise ZedError("unsafe filename in catalog")
+                parts.append(entry.name)
+                if not any(entry.parent_id):
+                    return Path(*reversed(parts))
+                parent = by_id.get(entry.parent_id)
+                if parent is None or not parent.is_dir:
+                    raise ZedError("missing parent directory")
+                entry = parent
+        return [(entry, relative(entry)) for entry in self.entries]
 
     def read(self, entry: Entry) -> bytes:
+        return b"".join(self.iter_read(entry))
+
+    def iter_read(self, entry: Entry) -> Iterator[bytes]:
+        """Yield decompressed pieces; output never exceeds the catalog size."""
         if entry.is_dir:
             raise ZedError("cannot read a directory")
         fid = entry.file_id
@@ -421,26 +463,45 @@ class ZedArchive:
         shuffled = bytes([fid[i] for i in (3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15)])
         name = shuffled[:-1].hex().upper() if shuffled[-1] == 0 else shuffled.hex().upper()
         encrypted = self.cfb.stream(name)
-        parts = []
+        decompressor = zlib.decompressobj()
+        produced = 0
         base_iv = xor(self.iv, fid) if self.version == 2 else self.iv
         for n, pos in enumerate(range(0, len(encrypted), 512)):
             counter = n.to_bytes(16, "little")
             # Version 2 mixes the file id into the IV before chunk numbering.
             iv = self.aes.cipher(xor(counter, base_iv), self.key, None, False)
-            parts.append(self.aes.decrypt_zed(encrypted[pos:pos + 512], self.key, iv, self.mode))
-        try:
-            data = zlib.decompress(b"".join(parts))
-        except zlib.error as exc:
-            raise ZedError(f"decompression failed for {entry.name!r}: {exc}") from exc
-        if len(data) != entry.size:
+            pending = self.aes.decrypt_zed(encrypted[pos:pos + 512], self.key, iv, self.mode)
+            while not decompressor.eof:
+                try:
+                    # Cap each step so a highly compressed chunk cannot balloon memory.
+                    data = decompressor.decompress(pending, self.MAX_PIECE)
+                except zlib.error as exc:
+                    raise ZedError(f"decompression failed for {entry.name!r}: {exc}") from exc
+                pending = decompressor.unconsumed_tail
+                produced += len(data)
+                if produced > entry.size:
+                    raise ZedError(f"size mismatch for {entry.name!r}")
+                yield data
+                # A full piece may leave buffered output even with no input left.
+                if not pending and len(data) < self.MAX_PIECE:
+                    break
+        if not decompressor.eof:
+            raise ZedError(f"decompression failed for {entry.name!r}: truncated stream")
+        if produced != entry.size:
             raise ZedError(f"size mismatch for {entry.name!r}")
-        return data
 
     def extract_to(self, output: Path, progress: Callable[[int, int, Path], None] | None = None) -> list[Path]:
         root = output.resolve()
         names = self.names()
         # Check every path before writing any files.
+        claimed: dict[str, Entry] = {}
         for entry, path in names:
+            # Zed archives come from case-insensitive Windows, and macOS folds
+            # case and Unicode normalization, so treat such names as one path.
+            key = unicodedata.normalize("NFC", str(path)).casefold()
+            other = claimed.setdefault(key, entry)
+            if other is not entry and not (entry.is_dir and other.is_dir):
+                raise ZedError(f"duplicate path in archive: {path}")
             current = root
             for component in path.parts:
                 current = current / component
@@ -459,20 +520,30 @@ class ZedArchive:
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("xb") as handle:
-                handle.write(self.read(entry))
+            try:
+                with target.open("xb") as handle:
+                    for piece in self.iter_read(entry):
+                        handle.write(piece)
+            except BaseException:
+                # Don't leave a partial file behind; it was created by us above.
+                target.unlink(missing_ok=True)
+                raise
             written.append(target)
             if progress is not None:
                 progress(len(written), len(files), target)
         return written
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="List or extract password-protected .zed archives")
     parser.add_argument("archive", type=Path)
     parser.add_argument("-o", "--output", type=Path, help="extract into this directory")
     parser.add_argument("--list", action="store_true", help="list files without extracting")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    # Fail before prompting rather than after the password has been typed.
+    if not args.archive.is_file():
+        print(f"zed: not a file: {args.archive}", file=sys.stderr)
+        return 1
     try:
         password = getpass.getpass("Zed password: ")
         archive = ZedArchive(args.archive, password)
@@ -486,6 +557,9 @@ def main() -> int:
     except (ZedError, OSError, UnicodeError) as exc:
         print(f"zed: {exc}", file=sys.stderr)
         return 1
+    except (KeyboardInterrupt, EOFError):
+        print("\nzed: interrupted", file=sys.stderr)
+        return 130
     return 0
 
 
